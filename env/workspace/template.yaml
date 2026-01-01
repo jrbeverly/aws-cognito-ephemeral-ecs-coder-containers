@@ -1,0 +1,523 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Per-user Coder workspace deployment — one stack per user workspace'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Workspace Identity
+        Parameters:
+          - WorkspaceId
+          - UserEmail
+          - WorkspacePassword
+      - Label:
+          default: Shared Platform Integration
+        Parameters:
+          - VpcId
+          - PublicSubnetIds
+          - PrivateSubnetIds
+          - EcsClusterName
+          - EcsTaskExecutionRoleArn
+          - EcsTaskRoleArn
+          - AlbSecurityGroupId
+          - HostedZoneId
+          - DomainName
+          - CertificateArn
+      - Label:
+          default: Identity
+        Parameters:
+          - CognitoUserPoolId
+          - CognitoUserPoolArn
+          - CognitoDomainPrefix
+      - Label:
+          default: Runtime
+        Parameters:
+          - ContainerImage
+      - Label:
+          default: Resource Sizing
+        Parameters:
+          - TaskCpu
+          - TaskMemory
+      - Label:
+          default: IAM & Network Boundary
+        Parameters:
+          - VpcCidr
+          - WorkspaceIamActions
+          - WorkspaceIamResourceArns
+
+Parameters:
+  # ── Workspace Identity ──
+  WorkspaceId:
+    Type: String
+    Description: Unique workspace identifier used in resource names and DNS subdomain
+    MinLength: 1
+    MaxLength: 20
+    AllowedPattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+    ConstraintDescription: Must be a valid DNS label (lowercase alphanumeric + hyphens, <= 20 chars)
+
+  UserEmail:
+    Type: String
+    Description: Email address of the Cognito user who owns this workspace
+
+  WorkspacePassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    Description: Unused; code-server runs with --auth none behind Cognito. Kept because the provisioning API still passes it
+
+  # ── Networking (shared platform outputs) ──
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Shared VPC ID
+
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets for ALB placement
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets for ECS task and EFS mount target placement
+
+  # ── ECS (shared platform outputs) ──
+  EcsClusterName:
+    Type: String
+    Description: Shared ECS cluster name
+
+  EcsTaskExecutionRoleArn:
+    Type: String
+    Description: Shared task execution role ARN (ECR pull, CloudWatch logs)
+
+  EcsTaskRoleArn:
+    Type: String
+    Description: Retained for compatibility. The stack creates a per-workspace task role; this parameter is no longer referenced by stack resources.
+
+  AlbSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Shared ALB security group ID (allows 443/80 ingress)
+
+  # ── Identity (shared platform outputs) ──
+  CognitoUserPoolId:
+    Type: String
+    Description: Cognito User Pool ID for ALB auth and app client
+
+  CognitoUserPoolArn:
+    Type: String
+    Description: Cognito User Pool ARN for ALB listener rule
+
+  CognitoDomainPrefix:
+    Type: String
+    Description: Cognito hosted UI domain prefix (for ALB authenticate action)
+
+  # ── DNS & TLS (shared platform outputs) ──
+  HostedZoneId:
+    Type: String
+    Description: Route 53 hosted zone ID for workspace DNS record
+
+  DomainName:
+    Type: String
+    Description: Root domain name (workspace subdomain = WorkspaceId.DomainName)
+
+  CertificateArn:
+    Type: String
+    Description: ACM certificate ARN for ALB HTTPS listener
+
+  # ── Runtime ──
+  ContainerImage:
+    Type: String
+    Description: ECR image URI for the workspace runtime (e.g., 123456789.dkr.ecr.us-east-1.amazonaws.com/workspace-runtime:latest)
+
+  # ── Resource Sizing ──
+  TaskCpu:
+    Type: Number
+    Default: 512
+    MinValue: 256
+    Description: CPU units for the ECS task (256 = 0.25 vCPU, 512 = 0.5 vCPU)
+
+  TaskMemory:
+    Type: Number
+    Default: 1024
+    MinValue: 512
+    Description: Memory in MB for the ECS task
+
+  # ── IAM & Network Boundary ──
+  VpcCidr:
+    Type: String
+    Description: VPC CIDR block for workspace egress scoping (e.g., 10.0.0.0/16)
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'
+
+  WorkspaceIamActions:
+    Type: CommaDelimitedList
+    Description: Allowed IAM actions for the workspace task role (comma-separated)
+    Default: logs:CreateLogStream,logs:PutLogEvents,logs:DescribeLogStreams,ssm:GetParameter,ssm:GetParameters
+
+  WorkspaceIamResourceArns:
+    Type: CommaDelimitedList
+    Description: Resource ARN patterns for workspace IAM policy scope
+    Default: '*'
+
+Resources:
+  # ═══════════════════════════════════════════════════════════════
+  # Storage
+  # ═══════════════════════════════════════════════════════════════
+
+  WorkspaceFileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Delete
+    Properties:
+      Encrypted: true
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub 'workspace-${WorkspaceId}'
+        - Key: WorkspaceId
+          Value: !Ref WorkspaceId
+
+  WorkspaceAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref WorkspaceFileSystem
+      PosixUser:
+        Uid: '1000'
+        Gid: '1000'
+      RootDirectory:
+        # CreationInfo only applies when EFS creates the path; "/" already
+        # exists owned by root, so uid 1000 could not write to it.
+        Path: /home
+        CreationInfo:
+          OwnerUid: '1000'
+          OwnerGid: '1000'
+          Permissions: '0755'
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'EFS mount for workspace ${WorkspaceId}'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref WorkspaceSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub 'workspace-${WorkspaceId}-efs'
+
+  EfsMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WorkspaceFileSystem
+      SubnetId: !Select [0, !Ref PrivateSubnetIds]
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  EfsMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WorkspaceFileSystem
+      SubnetId: !Select [1, !Ref PrivateSubnetIds]
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  # ═══════════════════════════════════════════════════════════════
+  # Networking
+  # ═══════════════════════════════════════════════════════════════
+
+  WorkspaceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'ECS tasks for workspace ${WorkspaceId}'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 7080
+          ToPort: 7080
+          SourceSecurityGroupId: !Ref AlbSecurityGroupId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: ECR image pull, CloudWatch Logs and package downloads via the NAT gateway
+      Tags:
+        - Key: Name
+          Value: !Sub 'workspace-${WorkspaceId}-tasks'
+
+  # ═══════════════════════════════════════════════════════════════
+  # Load Balancer
+  # ═══════════════════════════════════════════════════════════════
+
+  WorkspaceAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${WorkspaceId}-alb'
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroupId
+      Type: application
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '120'
+      Tags:
+        - Key: Name
+          Value: !Sub 'workspace-${WorkspaceId}'
+        - Key: WorkspaceId
+          Value: !Ref WorkspaceId
+
+  WorkspaceTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${WorkspaceId}-tg'
+      Port: 7080
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckPath: /healthz
+      HealthCheckPort: '7080'
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Name
+          Value: !Sub 'workspace-${WorkspaceId}'
+        - Key: WorkspaceId
+          Value: !Ref WorkspaceId
+
+  WorkspaceHttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WorkspaceAlb
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: authenticate-cognito
+          AuthenticateCognitoConfig:
+            UserPoolArn: !Ref CognitoUserPoolArn
+            UserPoolClientId: !Ref WorkspaceCognitoClient
+            UserPoolDomain: !Ref CognitoDomainPrefix
+            OnUnauthenticatedRequest: authenticate
+            SessionCookieName: AWSELBAuthSessionCookie
+            SessionTimeout: 604800
+            Scope: openid
+          Order: 1
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref WorkspaceTargetGroup
+          Order: 2
+
+  # ═══════════════════════════════════════════════════════════════
+  # Identity
+  # ═══════════════════════════════════════════════════════════════
+
+  WorkspaceCognitoClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref CognitoUserPoolId
+      ClientName: !Sub 'workspace-${WorkspaceId}'
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - email
+      SupportedIdentityProviders:
+        - COGNITO
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      RefreshTokenValidity: 30
+      CallbackURLs:
+        - !Sub 'https://${WorkspaceId}.${DomainName}/oauth2/idpresponse'
+      LogoutURLs:
+        - !Sub 'https://${WorkspaceId}.${DomainName}'
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+      SupportedIdentityProviders:
+        - COGNITO
+
+  # ═══════════════════════════════════════════════════════════════
+  # IAM
+  # ═══════════════════════════════════════════════════════════════
+
+  WorkspaceTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'workspace-${WorkspaceId}-task'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub 'workspace-${WorkspaceId}-scoped'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: !Ref WorkspaceIamActions
+                Resource: !Ref WorkspaceIamResourceArns
+      Tags:
+        - Key: WorkspaceId
+          Value: !Ref WorkspaceId
+        - Key: Name
+          Value: !Sub 'workspace-${WorkspaceId}-task'
+
+  # ═══════════════════════════════════════════════════════════════
+  # Compute
+  # ═══════════════════════════════════════════════════════════════
+
+  WorkspaceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/workspace-${WorkspaceId}'
+      RetentionInDays: 7
+      Tags:
+        - Key: WorkspaceId
+          Value: !Ref WorkspaceId
+
+  WorkspaceTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub 'workspace-${WorkspaceId}'
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref EcsTaskExecutionRoleArn
+      TaskRoleArn: !GetAtt WorkspaceTaskRole.Arn
+      Volumes:
+        - Name: workspace
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref WorkspaceFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref WorkspaceAccessPoint
+      ContainerDefinitions:
+        - Name: coder
+          Image: !Ref ContainerImage
+          PortMappings:
+            - ContainerPort: 7080
+              Protocol: tcp
+          MountPoints:
+            - SourceVolume: workspace
+              ContainerPath: /workspace
+              ReadOnly: false
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WorkspaceLogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: coder
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -fsS --max-time 3 http://localhost:7080/healthz || exit 1
+            Interval: 5
+            Timeout: 3
+            Retries: 3
+            StartPeriod: 30
+      Tags:
+        - Key: WorkspaceId
+          Value: !Ref WorkspaceId
+
+  WorkspaceService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - WorkspaceHttpsListener
+    Properties:
+      ServiceName: !Sub 'workspace-${WorkspaceId}'
+      Cluster: !Ref EcsClusterName
+      TaskDefinition: !Ref WorkspaceTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups:
+            - !Ref WorkspaceSecurityGroup
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - TargetGroupArn: !Ref WorkspaceTargetGroup
+          ContainerName: coder
+          ContainerPort: 7080
+      Tags:
+        - Key: WorkspaceId
+          Value: !Ref WorkspaceId
+
+  # ═══════════════════════════════════════════════════════════════
+  # DNS
+  # ═══════════════════════════════════════════════════════════════
+
+  WorkspaceDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub '${WorkspaceId}.${DomainName}.'
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt WorkspaceAlb.DNSName
+        HostedZoneId: !GetAtt WorkspaceAlb.CanonicalHostedZoneID
+
+Outputs:
+  # ── Endpoint ──
+  WorkspaceUrl:
+    Description: HTTPS URL users navigate to for workspace access
+    Value: !Sub 'https://${WorkspaceId}.${DomainName}'
+
+  WorkspaceDnsName:
+    Description: Fully qualified DNS name of the workspace
+    Value: !Sub '${WorkspaceId}.${DomainName}'
+
+  AlbDnsName:
+    Description: ALB DNS name (for debugging)
+    Value: !GetAtt WorkspaceAlb.DNSName
+
+  # ── Runtime ──
+  EcsServiceName:
+    Description: ECS service name in the shared cluster
+    Value: !GetAtt WorkspaceService.Name
+
+  EcsTaskDefinitionArn:
+    Description: ECS task definition ARN
+    Value: !Ref WorkspaceTaskDefinition
+
+  # ── Identity ──
+  CognitoClientId:
+    Description: Per-workspace Cognito app client ID
+    Value: !Ref WorkspaceCognitoClient
+
+  # ── IAM ──
+  WorkspaceTaskRoleArn:
+    Description: Per-workspace IAM role ARN (scoped to approved operational workflows)
+    Value: !GetAtt WorkspaceTaskRole.Arn
+
+  WorkspaceTaskRoleName:
+    Description: Per-workspace IAM role name
+    Value: !Ref WorkspaceTaskRole
+
+  # ── Lifecycle ──
+  WorkspaceStackId:
+    Description: This CloudFormation stack ID (authoritative workspace identity for cleanup)
+    Value: !Ref 'AWS::StackId'
+
+  WorkspaceStackName:
+    Description: This CloudFormation stack name
+    Value: !Ref 'AWS::StackName'

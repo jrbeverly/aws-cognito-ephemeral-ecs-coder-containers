@@ -1,0 +1,21 @@
+FROM node:20 AS portal
+ARG VITE_COGNITO_DOMAIN
+ARG VITE_COGNITO_CLIENT_ID
+WORKDIR /portal
+COPY app/PortalService/package.json app/PortalService/package-lock.json ./
+RUN npm ci
+COPY app/PortalService/ ./
+RUN npm run build
+
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS dotnet
+WORKDIR /src
+COPY src/ ./
+RUN dotnet publish ProvisioningService/ProvisioningService.Api/ProvisioningService.Api.csproj -c Release -o /out/api \
+ && dotnet publish CleanupService/CleanupService.Worker/CleanupService.Worker.csproj -c Release -o /out/cleanup
+
+FROM mcr.microsoft.com/dotnet/aspnet:10.0
+COPY --from=dotnet /out/api /app/api
+COPY --from=dotnet /out/cleanup /app/cleanup
+COPY --from=portal /portal/dist /app/api/wwwroot
+WORKDIR /app/api
+ENTRYPOINT ["dotnet", "ProvisioningService.Api.dll"]

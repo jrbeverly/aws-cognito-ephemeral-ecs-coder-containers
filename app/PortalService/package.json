@@ -1,0 +1,28 @@
+{
+  "name": "portal-service",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "echo \"Tests not configured yet\" && exit 0",
+    "type-check": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "@mdi/font": "^7.4.47",
+    "@tanstack/vue-query": "^5.62.0",
+    "pinia": "^2.3.0",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0",
+    "vuetify": "^3.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@vitejs/plugin-vue": "^5.2.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0",
+    "vue-tsc": "^2.2.0"
+  }
+}
